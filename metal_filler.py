@@ -82,14 +82,17 @@ USER_TEMPLATE = (
 )
 
 
-# ---------- Колонки в таблиці ----------------------------------------------
+# ---------- Заголовки колонок (для автодетекту) ----------------------------
 
-COL_INDEX = 1        # A - Індекс
-COL_NAME = 2         # B - Назва
-COL_UNIT = 3         # C - Одиниці
-COL_HAS_METAL = 4    # D - Наявність металу
-COL_MATERIAL = 5     # E - Назва матеріалу
-COL_METAL_QTY = 6    # F - Вміст металу
+# Ключове слово в заголовку -> внутрішнє ім'я.
+# Шукаємо по підрядку (без врахування регістру), пробілам, переносам рядка.
+HEADER_PATTERNS = {
+    "name":       ["назва"],            # ОЗМ
+    "unit":       ["одиниц"],           # Одиниці / единицы
+    "has_metal":  ["наявність метал", "наявн"],
+    "material":   ["назва матеріал", "матеріал"],
+    "metal_qty":  ["вміст метал"],
+}
 
 
 # ---------- LLM -------------------------------------------------------------
@@ -163,7 +166,45 @@ class ExcelBook:
         )
         self.ws = self._resolve_sheet()
         print(f"Аркуш: '{self.ws.Name}' (індекс {self.ws.Index})")
+        self.cols = self._detect_columns()
         return self
+
+    def _detect_columns(self) -> dict:
+        """Зчитує перший рядок і знаходить індекси колонок за ключовими словами."""
+        last_col = int(self.ws.Cells(1, self.ws.Columns.Count).End(-4159).Column)  # xlToLeft
+        # Іноді End(xlToLeft) повертає 1 на пустому рядку — підстраховка:
+        if last_col < 5:
+            last_col = max(last_col, 32)
+        header_row = self.ws.Range(
+            self.ws.Cells(1, 1), self.ws.Cells(1, last_col)
+        ).Value
+        if not isinstance(header_row, tuple):
+            header_row = (header_row,)
+        headers = header_row[0] if isinstance(header_row[0], tuple) else header_row
+        cols = {}
+        for col_idx, raw in enumerate(headers, start=1):
+            if raw is None:
+                continue
+            norm = " ".join(str(raw).lower().split())
+            for key, patterns in HEADER_PATTERNS.items():
+                if key in cols:
+                    continue
+                if any(p in norm for p in patterns):
+                    cols[key] = col_idx
+                    break
+        missing = [k for k in HEADER_PATTERNS if k not in cols]
+        if missing:
+            shown = {i + 1: headers[i] for i in range(len(headers)) if headers[i]}
+            raise RuntimeError(
+                f"Не знайдено колонки за заголовками: {missing}. "
+                f"Заголовки у файлі: {shown}"
+            )
+        print(
+            f"Колонки: Назва=col{cols['name']}, Одиниці=col{cols['unit']}, "
+            f"Наявність=col{cols['has_metal']}, Матеріал=col{cols['material']}, "
+            f"Вміст=col{cols['metal_qty']}"
+        )
+        return cols
 
     def _resolve_sheet(self):
         sheets = self.wb.Worksheets
@@ -193,51 +234,43 @@ class ExcelBook:
             pythoncom.CoUninitialize()
 
     def last_row(self) -> int:
-        # xlUp = -4162
-        return int(self.ws.Cells(self.ws.Rows.Count, COL_NAME).End(-4162).Row)
+        # xlUp = -4162; визначаємо по колонці "Назва"
+        return int(self.ws.Cells(self.ws.Rows.Count, self.cols["name"]).End(-4162).Row)
 
     def read_block(self, start_row: int, end_row: int) -> list[tuple[str, str, object]]:
-        """Повертає список (name, unit, has_metal_value) для рядків [start..end]."""
-        rng = self.ws.Range(
-            self.ws.Cells(start_row, COL_NAME),
-            self.ws.Cells(end_row, COL_HAS_METAL),
-        ).Value
-        if end_row == start_row:
-            rng = (rng,)
-        out = []
-        for tup in rng:
-            name, unit, has_metal = tup[0], tup[1], tup[2]
-            out.append((name, unit, has_metal))
-        return out
+        """Повертає (name, unit, has_metal_value) для рядків [start..end]."""
+        c_name = self.cols["name"]
+        c_unit = self.cols["unit"]
+        c_has = self.cols["has_metal"]
+
+        def read_col(col):
+            rng = self.ws.Range(
+                self.ws.Cells(start_row, col), self.ws.Cells(end_row, col)
+            ).Value
+            # Excel повертає кортеж кортежів для діапазону, або скалярне значення для 1 комірки
+            if end_row == start_row:
+                return [rng]
+            return [row[0] if isinstance(row, tuple) else row for row in rng]
+
+        names = read_col(c_name)
+        units = read_col(c_unit)
+        hases = read_col(c_has)
+        return list(zip(names, units, hases))
 
     def write_results(self, rows: list[Row], results: list[dict]):
-        """Запис блоком D:F для діапазону рядків."""
+        """Запис у три колонки (можуть бути несуміжними) — комірка за коміркою."""
         if not rows:
             return
-        # Сортуємо за excel_row на випадок
-        pairs = sorted(zip(rows, results), key=lambda p: p[0].excel_row)
-        # Пишемо по неперервних сегментах
-        seg_start = 0
-        for k in range(1, len(pairs) + 1):
-            if k == len(pairs) or pairs[k][0].excel_row != pairs[k - 1][0].excel_row + 1:
-                segment = pairs[seg_start:k]
-                first_row = segment[0][0].excel_row
-                last_row = segment[-1][0].excel_row
-                values = []
-                for _, r in segment:
-                    has = bool(r.get("has_metal"))
-                    mat = r.get("material") if has else None
-                    qty = r.get("metal_kg_per_unit") if has else None
-                    values.append([
-                        "так" if has else "ні",
-                        mat if mat is not None else "",
-                        qty if qty is not None else "",
-                    ])
-                self.ws.Range(
-                    self.ws.Cells(first_row, COL_HAS_METAL),
-                    self.ws.Cells(last_row, COL_METAL_QTY),
-                ).Value = values
-                seg_start = k
+        c_has = self.cols["has_metal"]
+        c_mat = self.cols["material"]
+        c_qty = self.cols["metal_qty"]
+        for row_obj, r in zip(rows, results):
+            has = bool(r.get("has_metal"))
+            mat = r.get("material") if has else None
+            qty = r.get("metal_kg_per_unit") if has else None
+            self.ws.Cells(row_obj.excel_row, c_has).Value = "так" if has else "ні"
+            self.ws.Cells(row_obj.excel_row, c_mat).Value = mat if mat is not None else ""
+            self.ws.Cells(row_obj.excel_row, c_qty).Value = qty if qty is not None else ""
 
     def save(self):
         # 50 = xlExcel12 (.xlsb)
@@ -251,15 +284,14 @@ def is_empty(v) -> bool:
 
 
 def find_first_empty(book: ExcelBook, last_row: int, header_rows: int) -> int:
-    """Знаходимо перший рядок з пустою "Наявність металу"."""
-    # Читаємо колонку D одним блоком — швидко
+    """Знаходимо перший рядок з пустою колонкою "Наявність металу"."""
+    col = book.cols["has_metal"]
     rng = book.ws.Range(
-        book.ws.Cells(header_rows + 1, COL_HAS_METAL),
-        book.ws.Cells(last_row, COL_HAS_METAL),
+        book.ws.Cells(header_rows + 1, col),
+        book.ws.Cells(last_row, col),
     ).Value
     if last_row == header_rows + 1:
         rng = (rng,) if not isinstance(rng, tuple) else rng
-        rng = [(rng[0],)] if not isinstance(rng[0], tuple) else rng
     for i, tup in enumerate(rng):
         v = tup[0] if isinstance(tup, tuple) else tup
         if is_empty(v):
@@ -276,6 +308,12 @@ def main():
     ap.add_argument("--save-every", type=int, default=1000, help="Зберігати кожні N рядків")
     ap.add_argument("--delay", type=float, default=0.4, help="Пауза між запитами, сек")
     ap.add_argument("--limit", type=int, default=0, help="Обробити максимум N рядків (0 = всі)")
+    ap.add_argument(
+        "--reset-cols",
+        default="",
+        help="Спочатку очистити вміст вказаних колонок (літери або номери, кома). "
+             "Напр.: --reset-cols D,E,F. За замовч. — нічого не чистити.",
+    )
     args = ap.parse_args()
 
     client, deployment = build_client()
@@ -285,6 +323,20 @@ def main():
 
     with ExcelBook(args.file, sheet_arg) as book:
         last = book.last_row()
+        if args.reset_cols.strip():
+            cols_to_clear = [c.strip() for c in args.reset_cols.split(",") if c.strip()]
+            for c in cols_to_clear:
+                col_ref = c if not c.isdigit() else int(c)
+                if isinstance(col_ref, str):
+                    rng = f"{col_ref}{args.header_rows + 1}:{col_ref}{last}"
+                    book.ws.Range(rng).ClearContents()
+                else:
+                    book.ws.Range(
+                        book.ws.Cells(args.header_rows + 1, col_ref),
+                        book.ws.Cells(last, col_ref),
+                    ).ClearContents()
+                print(f"  очищено колонку {c} (рядки {args.header_rows + 1}..{last})")
+            book.save()
         start = find_first_empty(book, last, args.header_rows)
         if start > last:
             print("Всі рядки вже заповнені.")
