@@ -144,9 +144,11 @@ def call_llm(client: AzureOpenAI, deployment: str, batch: list[Row]) -> list[dic
 # ---------- Excel (win32com, читання/запис .xlsb) --------------------------
 
 class ExcelBook:
-    def __init__(self, path: str, sheet: str):
+    def __init__(self, path: str, sheet):
         self.path = os.path.abspath(path)
-        self.sheet_name = sheet
+        # sheet: None  -> перший аркуш; int -> за індексом (1-based);
+        #        str   -> за назвою. Числовий рядок ("1") теж сприймається як назва.
+        self.sheet = sheet
         self.app = None
         self.wb = None
         self.ws = None
@@ -157,9 +159,30 @@ class ExcelBook:
         self.app.Visible = False
         self.app.DisplayAlerts = False
         self.app.ScreenUpdating = False
-        self.wb = self.app.Workbooks.Open(self.path)
-        self.ws = self.wb.Worksheets(self.sheet_name)
+        self.wb = self.app.Workbooks.Open(
+            self.path, UpdateLinks=0, ReadOnly=False, IgnoreReadOnlyRecommended=True
+        )
+        self.ws = self._resolve_sheet()
+        print(f"Аркуш: '{self.ws.Name}' (індекс {self.ws.Index})")
         return self
+
+    def _resolve_sheet(self):
+        sheets = self.wb.Worksheets
+        if self.sheet is None:
+            return sheets(1)
+        if isinstance(self.sheet, int):
+            return sheets(self.sheet)
+        # str — спершу пробуємо за назвою, потім fallback на індекс,
+        # якщо рядок є числом ("1") і аркуша з такою назвою нема.
+        try:
+            return sheets(self.sheet)
+        except pythoncom.com_error:
+            if self.sheet.isdigit():
+                return sheets(int(self.sheet))
+            available = [sheets(i + 1).Name for i in range(sheets.Count)]
+            raise RuntimeError(
+                f"Аркуш '{self.sheet}' не знайдено. Доступні: {available}"
+            )
 
     def __exit__(self, exc_type, exc, tb):
         try:
@@ -258,19 +281,10 @@ def main():
 
     client, deployment = build_client()
 
-    sheet_name = args.sheet
-    if sheet_name is None:
-        # Відкриваємо щоб дізнатись назву першого аркуша
-        pythoncom.CoInitialize()
-        app = win32.gencache.EnsureDispatch("Excel.Application")
-        app.Visible = False
-        wb = app.Workbooks.Open(os.path.abspath(args.file))
-        sheet_name = wb.Worksheets(1).Name
-        wb.Close(SaveChanges=False)
-        app.Quit()
-        pythoncom.CoUninitialize()
+    # None -> перший аркуш; інакше передаємо рядок як є.
+    sheet_arg = args.sheet
 
-    with ExcelBook(args.file, sheet_name) as book:
+    with ExcelBook(args.file, sheet_arg) as book:
         last = book.last_row()
         start = find_first_empty(book, last, args.header_rows)
         if start > last:
