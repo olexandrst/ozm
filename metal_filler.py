@@ -128,7 +128,6 @@ def call_llm(client: AzureOpenAI, deployment: str, batch: list[Row]) -> list[dic
             {"role": "user", "content": USER_TEMPLATE.format(items_json=json.dumps(items, ensure_ascii=False))},
         ],
         response_format={"type": "json_object"},
-        temperature=0,
     )
     payload = json.loads(resp.choices[0].message.content)
     results = payload.get("results", [])
