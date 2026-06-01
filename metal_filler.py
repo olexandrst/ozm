@@ -32,7 +32,7 @@ import win32com.client as win32
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from openai import APIError, RateLimitError, APITimeoutError
+from openai import APIError, RateLimitError, APITimeoutError, APIConnectionError
 
 
 # ---------- Промпт ----------------------------------------------------------
@@ -118,9 +118,11 @@ def build_client() -> tuple[AzureOpenAI, str]:
 
 @retry(
     reraise=True,
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, min=2, max=60),
-    retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
+    stop=stop_after_attempt(15),
+    wait=wait_exponential(multiplier=2, min=5, max=180),
+    retry=retry_if_exception_type(
+        (RateLimitError, APITimeoutError, APIConnectionError, APIError)
+    ),
 )
 def call_llm(client: AzureOpenAI, deployment: str, batch: list[Row]) -> list[dict]:
     items = [{"i": i, "name": r.name, "unit": r.unit} for i, r in enumerate(batch)]
@@ -360,12 +362,40 @@ def main():
                 rows.append(Row(excel_row=excel_row, name=str(name), unit=str(unit or "")))
 
             if rows:
-                try:
-                    results = call_llm(client, deployment, rows)
-                    book.write_results(rows, results)
-                except Exception as e:
-                    print(f"[!] Помилка на рядках {rows[0].excel_row}..{rows[-1].excel_row}: {e}",
-                          file=sys.stderr)
+                # Повторюємо той самий батч до успіху. Усередині call_llm
+                # вже є tenacity (~25 хв ретраїв); тут ще додатковий зовнішній
+                # цикл на випадок тривалого падіння мережі.
+                max_outer_attempts = 5
+                outer_attempt = 0
+                wrote = False
+                while not wrote:
+                    outer_attempt += 1
+                    try:
+                        results = call_llm(client, deployment, rows)
+                        book.write_results(rows, results)
+                        wrote = True
+                    except Exception as e:
+                        if outer_attempt >= max_outer_attempts:
+                            print(
+                                f"[FATAL] Не вдалось обробити рядки "
+                                f"{rows[0].excel_row}..{rows[-1].excel_row} "
+                                f"після {max_outer_attempts} зовнішніх спроб: {e}. "
+                                f"Завершую. Перезапустіть скрипт — він продовжить "
+                                f"з цього ж рядка.",
+                                file=sys.stderr,
+                            )
+                            if processed_since_save > 0:
+                                book.save()
+                            sys.exit(2)
+                        backoff = 60 * outer_attempt
+                        print(
+                            f"[!] Помилка на рядках "
+                            f"{rows[0].excel_row}..{rows[-1].excel_row} "
+                            f"(зовн. спроба {outer_attempt}/{max_outer_attempts}): "
+                            f"{e}. Чекаю {backoff} c і повторюю той самий батч.",
+                            file=sys.stderr,
+                        )
+                        time.sleep(backoff)
                 processed_since_save += len(rows)
                 total_processed += len(rows)
                 print(f"  оброблено {total_processed} (рядки {rows[0].excel_row}..{rows[-1].excel_row})")
